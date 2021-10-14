@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <unistd.h>
 
@@ -8,49 +9,96 @@
 
 #include <netinet/in.h>
 
-#define errchck(x) if ((x) == -1) { \
-		   perror(NULL); \
+#define errchck(x,y) if ((x) == -1) { \
+		   perror(y); \
 		   exit(EXIT_FAILURE); }
 
 int main()
 {
-	char server_message[256] = "You have reached server!\n";
+	int listenfd, connfd;
+
+	struct sockaddr_in addr;
+
+	char req_header[1024];
+	char *req_method, *req_uri, *req_version;
+
+	char res_200[] = "HTTP/1.1 200 OK\r\n\r\n";
+	char res_404[] = "HTTP/1.1 404 Not Found\r\n\r\n";
+	char res_501[] = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+	int headsize;
+
+	char htmlname[1024];
+	FILE *htmlfile, *tempfile;
+	long htmlsize;
+
+	char *res;
 
 	/* create socket */
-	int server_socket;
-	errchck(server_socket = socket(AF_INET, SOCK_STREAM, 0));
-	/* socket(domain, type, protocol) - returns file descriptor for socket
-	 * domain - internet or filesystem socket - AF_INET - internet socket
-	 * type - TCP or UDP socket - SOCK_STREAM - TCP
-	 * protocol - specify protocol if socket is raw - 0 - use protocol specified in type */
+	errchck(listenfd = socket(AF_INET, SOCK_STREAM, 0), "socket");
 
 	/* specify address for socket */
-	struct sockaddr_in server_address;
-	/* struct sockaddr_in
-	 * sin_family- need to be same as domain in socket
-	 * sin_port
-	 * sin_addr */
-	server_address.sin_family = AF_INET;
-	server_address.sin_port = htons(9002);
-	/* htons(hostshort) - translate unsigned short into network byte order */
-	server_address.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(8000);
+	addr.sin_addr.s_addr = INADDR_ANY;
 
 	/* bind socket to specified address */
-	errchck(bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)));
+	errchck(bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)), "bind");
 
 	/* listen to connections */
-	errchck(listen(server_socket, 5));
+	errchck(listen(listenfd, 5), "listen");
 
-	/* accept the connection to send data */
-	int client_socket;
-	errchck(client_socket = accept(server_socket, NULL, NULL));
+	while (1) {
+		/* accept connection */
+		errchck(connfd = accept(listenfd, NULL, NULL), "accept");
 
-	/* send data to client */
-	errchck(send(client_socket, server_message, sizeof(server_message), 0));
+		/* receive request from client */
+		errchck(read(connfd, req_header, sizeof(req_header)), "read");
 
-	/* close sockets */
-	errchck(close(client_socket));
-	errchck(close(server_socket));
+		/* parse request header */
+		req_method = strtok(req_header, " ");
+		req_uri = strtok(NULL, " ");
+		req_version = strtok(NULL, "\n");
+
+		if (!strcmp(req_method, "GET")) { /* send data to client */
+			/* get html file name */
+			if (!strcmp(req_uri, "/")) {
+				sprintf(htmlname, "./index.html");
+			} else {
+				sprintf(htmlname, ".%s", req_uri);
+			}
+
+			/* read html file if exists, then send */
+			if ((htmlfile = fopen(htmlname, "r")) != NULL) {
+				/* get html file size */
+				tempfile = fopen(htmlname, "rb");
+				fseek(tempfile, 0, SEEK_END);
+				htmlsize = ftell(tempfile);
+				fclose(tempfile);
+
+				/* get header size */
+				headsize = sizeof(res_200);
+
+				/* create response */
+				res = malloc(headsize + htmlsize);
+				strcat(res, res_200);
+				fread(res+headsize-1, 1, htmlsize, htmlfile);
+
+				/* close html file */
+				fclose(htmlfile);
+
+				errchck(write(connfd, res, headsize+htmlsize), "write");
+			} else {
+				errchck(write(connfd, res_404, sizeof(res_404)), "write");
+			}
+		} else if (!strcmp(req_method, "HEAD")) { /* send header to client */
+			errchck(write(connfd, res_200, sizeof(res_200)), "write");
+		} else { /* method not implemented */
+			errchck(write(connfd, res_501, sizeof(res_501)), "write");
+		}
+
+		/* close connection */
+		errchck(close(connfd), "close");
+	}
 
 	return 0;
 }
