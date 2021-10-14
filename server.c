@@ -9,12 +9,10 @@
 
 #include <netinet/in.h>
 
-#define errchck(x,y) if ((x) == -1) { \
-		   perror(y); \
-		   exit(EXIT_FAILURE); }
-
-int main()
+int main(int argc, char *argv[])
 {
+	short port;
+
 	int listenfd, connfd;
 
 	struct sockaddr_in addr;
@@ -25,34 +23,42 @@ int main()
 	char res_200[] = "HTTP/1.1 200 OK\r\n\r\n";
 	char res_404[] = "HTTP/1.1 404 Not Found\r\n\r\n";
 	char res_501[] = "HTTP/1.1 501 Not Implemented\r\n\r\n";
-	int headsize;
 
 	char htmlname[1024];
-	FILE *htmlfile, *tempfile;
-	long htmlsize;
+	FILE *htmlfile;
 
-	char *res;
+	char res_buf[1024];
+	int res_size;
+
+	if (argc == 1) {
+		port = 8000;
+	} else if (argc == 2) {
+		port = atoi(argv[1]);
+	} else {
+		printf("usage: %s [port]\n", argv[0]);
+		exit(EXIT_SUCCESS);
+	}
 
 	/* create socket */
-	errchck(listenfd = socket(AF_INET, SOCK_STREAM, 0), "socket");
+	listenfd = socket(AF_INET, SOCK_STREAM, 0);
 
 	/* specify address for socket */
 	addr.sin_family = AF_INET;
-	addr.sin_port = htons(8000);
+	addr.sin_port = htons(port);
 	addr.sin_addr.s_addr = INADDR_ANY;
 
 	/* bind socket to specified address */
-	errchck(bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)), "bind");
+	bind(listenfd, (struct sockaddr *)&addr, sizeof(addr));
 
 	/* listen to connections */
-	errchck(listen(listenfd, 5), "listen");
+	listen(listenfd, 5);
 
 	while (1) {
 		/* accept connection */
-		errchck(connfd = accept(listenfd, NULL, NULL), "accept");
+		connfd = accept(listenfd, NULL, NULL);
 
 		/* receive request from client */
-		errchck(read(connfd, req_header, sizeof(req_header)), "read");
+		read(connfd, req_header, sizeof(req_header));
 
 		/* parse request header */
 		req_method = strtok(req_header, " ");
@@ -69,35 +75,24 @@ int main()
 
 			/* read html file if exists, then send */
 			if ((htmlfile = fopen(htmlname, "r")) != NULL) {
-				/* get html file size */
-				tempfile = fopen(htmlname, "rb");
-				fseek(tempfile, 0, SEEK_END);
-				htmlsize = ftell(tempfile);
-				fclose(tempfile);
-
-				/* get header size */
-				headsize = sizeof(res_200);
-
-				/* create response */
-				res = malloc(headsize + htmlsize);
-				strcat(res, res_200);
-				fread(res+headsize-1, 1, htmlsize, htmlfile);
-
-				/* close html file */
+				write(connfd, res_200, sizeof(res_200)-1);
+				while ((res_size = fread(res_buf, 1, sizeof(res_buf), htmlfile)) != 0)
+					write(connfd, res_buf, res_size);
 				fclose(htmlfile);
-
-				errchck(write(connfd, res, headsize+htmlsize), "write");
 			} else {
-				errchck(write(connfd, res_404, sizeof(res_404)), "write");
+				/* file doesn't exist */
+				write(connfd, res_404, sizeof(res_404));
 			}
-		} else if (!strcmp(req_method, "HEAD")) { /* send header to client */
-			errchck(write(connfd, res_200, sizeof(res_200)), "write");
-		} else { /* method not implemented */
-			errchck(write(connfd, res_501, sizeof(res_501)), "write");
+		} else if (!strcmp(req_method, "HEAD")) {
+			/* send header to client */
+			write(connfd, res_200, sizeof(res_200));
+		} else {
+			/* method not implemented */
+			write(connfd, res_501, sizeof(res_501));
 		}
 
 		/* close connection */
-		errchck(close(connfd), "close");
+		close(connfd);
 	}
 
 	return 0;
