@@ -3,51 +3,88 @@
 #include <string.h>
 
 #include <unistd.h>
+#include <signal.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include <netinet/in.h>
 
-char *get_type(const char *filename);
+typedef struct _request {
+	char *method;
+	char *uri;
+	char *version;
+	char *headers;
+	char *body;
+	char buf[4096];
+} request;
 
-int main(int argc, char *argv[])
+enum codes { C400, C403, C404, C501 };
+
+void sigchldhandler(int sig);
+int server_init(short port);
+int server_request(int listenfd, request* req);
+void server_response(int connfd, request* req);
+void error_page(int connfd, int code);
+long content_length(const char* filename);
+char* content_type(const char* filename);
+
+int main(int argc, char* argv[])
 {
-	short port;
+	short port=8000, quite=0;
 
 	int listenfd, connfd;
 
-	struct sockaddr_in addr;
+	request req;
 
-	char req_header[1024];
-	char *req_method, *req_uri, *req_version;
-
-	char content_name[1024];
-	char *args;
-	char content_args[1024];
-	FILE *content_file;
-	struct stat content_stat;
-
-	char res_200[] = "HTTP/1.0 200 OK\r\n";
-	char res_404[] = "HTTP/1.0 404 Not Found\r\n\r\n";
-	char res_501[] = "HTTP/1.0 501 Not Implemented\r\n\r\n";
-
-	char res_buf[1024];
-	int res_size;
-
-	if (argc == 1) {
-		port = 8000;
-	} else if (argc == 2) {
-		port = atoi(argv[1]);
-	} else {
-		printf("usage: %s [port]\n", argv[0]);
-		exit(EXIT_SUCCESS);
+	/* parse arguments */
+	for (++argv; --argc; ++argv) {
+		if (!strcmp(*argv, "--help")) {
+			printf("Usage: server [-OPTIONS] [PORT]\n"
+			       "If no port specified, then equals 8000\n"
+			       "-q, --quite Server doesn't output incoming requests\n"
+			       "    --help  Output this message and exit\n");
+			exit(EXIT_SUCCESS);
+		} else if (!strcmp(*argv, "-q") || !strcmp(*argv, "--quite")) {
+			quite = 1;
+		} else {
+			port = atoi(*argv);
+		}
 	}
 
+	/* initialize server */
+	listenfd = server_init(port);
+
+	while (1) {
+		/* receive request from client */
+		if ((connfd = server_request(listenfd, &req)) == -1)
+			{ continue; }
+
+		/* print request line and headers */
+		if (!quite) {
+			printf("%s %s %s\n%s\n", req.method, req.uri, req.version, req.headers);
+			printf("-----------------------------------------------------------\n");
+		}
+
+		/* send response to client */
+		server_response(connfd, &req);
+	}
+
+	return 0;
+}
+
+int server_init(short port)
+{
+	int listenfd;
+	struct sockaddr_in addr;
+
+	/* set handler for SIGCHLD */
+	signal(SIGCHLD, sigchldhandler);
+
 	/* create socket */
-	listenfd = socket(AF_INET, SOCK_STREAM, 0);
+	if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+		{ perror("socket"); exit(EXIT_FAILURE); }
 
 	/* specify address for socket */
 	addr.sin_family = AF_INET;
@@ -55,76 +92,172 @@ int main(int argc, char *argv[])
 	addr.sin_addr.s_addr = INADDR_ANY;
 
 	/* bind socket to specified address */
-	bind(listenfd, (struct sockaddr *)&addr, sizeof(addr));
+	if (bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
+		{ perror("bind"); exit(EXIT_FAILURE); }
 
 	/* listen to connections */
-	listen(listenfd, 5);
+	if (listen(listenfd, 5) == -1)
+		{ perror("listen"); exit(EXIT_FAILURE); }
 
-	while (1) {
-		/* accept connection */
-		connfd = accept(listenfd, NULL, NULL);
-
-		/* receive request from client */
-		read(connfd, req_header, sizeof(req_header));
-
-		/* parse request header */
-		req_method = strtok(req_header, " ");
-		req_uri = strtok(NULL, " ");
-		req_version = strtok(NULL, "\n");
-
-		if (!strcmp(req_method, "GET")) { /* send data to client */
-			/* parse uri */
-			if (!strcmp(req_uri, "/")) { /* root */
-				strcpy(content_name, "./index.html");
-				strcpy(content_args, "");
-			} else { /* standard */
-				strcpy(content_name, ".");
-				strcat(content_name, strtok(req_uri, "?\0"));
-				strcpy(content_args, "QUERY_STRING=");
-				if (args = strtok(NULL, "\0"))
-					strcat(content_args, args);
-			}
-
-			if (!stat(content_name, &content_stat)) {
-				/* correct response */
-				write(connfd, res_200, sizeof(res_200)-1);
-				if (!strncmp(content_name, "./cgi-bin/", 10)) { /* serving dynamic content */
-					if (!fork()) {
-						putenv(content_args);
-						dup2(connfd, 1);
-						execl(content_name, content_name, NULL);
-						exit(EXIT_SUCCESS);
-					} else {
-						wait(NULL);
-					}
-				} else { /* serving static content */
-					sprintf(res_buf, "Connection: close\r\n"
-							 "Content-length: %ld\r\n"
-							 "Content-type: %s\r\n\r\n",
-							 content_stat.st_size, get_type(content_name));
-					write(connfd, res_buf, strlen(res_buf));
-					content_file = fopen(content_name, "r");
-					while ((res_size = fread(res_buf, 1, sizeof(res_buf), content_file)) != 0)
-						write(connfd, res_buf, res_size);
-					fclose(content_file);
-				}
-			} else {
-				/* file doesn't exist */
-				write(connfd, res_404, sizeof(res_404));
-			}
-		} else {
-			/* method not implemented */
-			write(connfd, res_501, sizeof(res_501));
-		}
-
-		/* close connection */
-		close(connfd);
-	}
-
-	return 0;
+	/* return server file descriptor */
+	return listenfd;
 }
 
-char *get_type(const char *filename)
+int server_request(int listenfd, request* req)
+{
+	int connfd;
+
+	/* accept connection */
+	if ((connfd = accept(listenfd, NULL, NULL)) == -1)
+		{ perror("accept"); return -1; }
+
+	/* clear buffer and receive data from client */
+	memset(req->buf, 0, sizeof(req->buf));
+	if (read(connfd, req->buf, sizeof(req->buf)) == -1)
+		{ perror("read"); close(connfd); return -1; }
+
+	/* parse request */
+	req->body = strstr(req->buf, "\r\n\r\n"); 
+	req->method = strtok(req->buf, " ");
+	req->uri = strtok(NULL, " ");
+	req->version = strtok(NULL, "\r");
+	req->headers = strtok(NULL, "");
+
+	/* check for invalid syntax */
+	if (!req->method || !req->uri || !req->version || !req->headers || !req->body)
+		{ error_page(connfd, C400); close(connfd); return -1; }
+
+	/* final pointers preparations */
+	req->headers += 1;
+	*(req->body+2) = '\0';
+	req->body += 4;
+
+	/* return client file descriptor */
+	return connfd;
+}
+
+void server_response(int connfd, request* req)
+{
+	char content_name[1024];
+	char *args;
+	char content_args[1024];
+	FILE *content_file;
+	int send_body;
+
+	char res_buf[1024];
+	int res_size;
+
+	/* parse uri */
+	if (!strcmp(req->uri, "/")) { /* root */
+		strcpy(content_name, "./index.html");
+		strcpy(content_args, "");
+	} else { /* standard */
+		strcpy(content_name, ".");
+		strcat(content_name, strtok(req->uri, "?\0"));
+		strcpy(content_args, "QUERY_STRING=");
+		if (args = strtok(NULL, "\0"))
+			strcat(content_args, args);
+	}
+
+	/* send data to client */
+	if ((send_body = !strcmp(req->method, "GET")) || !strcmp(req->method, "HEAD")) {
+		/* check if file exists*/
+		if (access(content_name, F_OK) == -1)
+			{ error_page(connfd, C404); return; }
+
+		/* serving dynamic content */
+		if (!strncmp(content_name, "./cgi-bin/", 10)) {
+			/* check for execution permisiion */
+			if (access(content_name, X_OK) == -1)
+				{ error_page(connfd, C403); return; }
+
+			/* execute script */
+			if (!fork()) {
+				putenv(content_args);
+				sprintf(res_buf, "REQUEST_METHOD=%s", req->method);
+				putenv(res_buf);
+				dup2(connfd, 1);
+				write(connfd, "HTTP/1.0 200 OK\r\n", 17);
+				execl(content_name, content_name, NULL);
+				exit(EXIT_SUCCESS);
+			}
+
+			/* close connection */
+			close(connfd);
+
+		/* serving static content */
+		} else {
+			/* check for execution permisiion */
+			if (access(content_name, R_OK) == -1)
+				{ error_page(connfd, C403); return; }
+
+			/* generate response line and headers */
+			sprintf(res_buf, "HTTP/1.0 200 OK\r\n"
+					 "Content-length: %ld\r\n"
+					 "Content-type: %s\r\n\r\n",
+					 content_length(content_name), content_type(content_name));
+
+			/* send headers */
+			write(connfd, res_buf, strlen(res_buf));
+
+			/* send body */
+			if (send_body) {
+				content_file = fopen(content_name, "r");
+				while ((res_size = fread(res_buf, 1, sizeof(res_buf), content_file)) != 0)
+					write(connfd, res_buf, res_size);
+				fclose(content_file);
+			}
+
+			/* close connection */
+			close(connfd);
+		}
+
+	/* receive data from client */
+	} else if (!strcmp(req->method, "POST")) {
+		error_page(connfd, C501);
+
+	/* method not implemented */
+	} else {
+		error_page(connfd, C501);
+	}
+}
+
+void error_page(int connfd, int code)
+{
+	static const char *errhead[] = { "HTTP/1.0 400 Bad Request\r\n\r\n",
+					 "HTTP/1.0 403 Forbidden\r\n",
+					 "HTTP/1.0 404 Not Found\r\n\r\n",
+					 "HTTP/1.0 501 Not Implemented\r\n\r\n" };
+	char errbody[1024];
+
+	/* generate error page */
+	sprintf(errbody, 
+		"<html><head><title>%s</title></head>"
+		"<body><center><h1>%s</h1></center><hr><center>web_server 1.0</center></body></html>\r\n\r\n",
+		errhead[code]+9, errhead[code]+9);
+
+	/* send to client */
+	write(connfd, errhead[code], strlen(errhead[code]));
+	write(connfd, errbody, strlen(errbody));
+
+	/* close connection */
+	close(connfd);
+}
+
+long content_length(const char* filename)
+{
+	long length;
+	FILE *file;
+
+	file = fopen(filename, "r");
+	fseek(file, 0, SEEK_END);
+	length = ftell(file);
+	fclose(file);
+
+	return length;
+}
+
+char* content_type(const char* filename)
 {
 	if (strstr(filename, ".html"))
 		return "text/html";
@@ -132,8 +265,16 @@ char *get_type(const char *filename)
 		return "image/gif";
 	else if (strstr(filename, ".png"))
 		return "image/png";
-	else if (strstr(filename, ".jpeg"))
+	else if (strstr(filename, ".jpeg") || strstr(filename, ".jpg"))
 		return "image/jpeg";
+	else if (strstr(filename, ".mp4"))
+		return "video/mp4";
 	else
 		return "text/plain";
+}
+
+void sigchldhandler(int sig)
+{
+	while (waitpid(-1, NULL, WNOHANG) > 0)
+		;
 }

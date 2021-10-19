@@ -1,3 +1,4 @@
 server
 *.html
+test*
 cgi-bin*
