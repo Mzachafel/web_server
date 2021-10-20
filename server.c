@@ -79,8 +79,9 @@ int server_init(short port)
 	int listenfd;
 	struct sockaddr_in addr;
 
-	/* set handler for SIGCHLD */
+	/* set handlers for signals */
 	signal(SIGCHLD, sigchldhandler);
+	signal(SIGPIPE, SIG_IGN);
 
 	/* create socket */
 	if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
@@ -113,7 +114,7 @@ int server_request(int listenfd, request* req)
 
 	/* clear buffer and receive data from client */
 	memset(req->buf, 0, sizeof(req->buf));
-	if (read(connfd, req->buf, sizeof(req->buf)) == -1)
+	if (read(connfd, req->buf, sizeof(req->buf)-1) == -1)
 		{ perror("read"); close(connfd); return -1; }
 
 	/* parse request */
@@ -131,6 +132,7 @@ int server_request(int listenfd, request* req)
 	req->headers += 1;
 	*(req->body+2) = '\0';
 	req->body += 4;
+	req->buf[4095] = '\0';
 
 	/* return client file descriptor */
 	return connfd;
@@ -159,11 +161,12 @@ void server_response(int connfd, request* req)
 			strcat(content_args, args);
 	}
 
+	/* check if file exists*/
+	if (access(content_name, F_OK) == -1)
+		{ error_page(connfd, C404); return; }
+
 	/* send data to client */
 	if ((send_body = !strcmp(req->method, "GET")) || !strcmp(req->method, "HEAD")) {
-		/* check if file exists*/
-		if (access(content_name, F_OK) == -1)
-			{ error_page(connfd, C404); return; }
 
 		/* serving dynamic content */
 		if (!strncmp(content_name, "./cgi-bin/", 10)) {
@@ -179,11 +182,7 @@ void server_response(int connfd, request* req)
 				dup2(connfd, 1);
 				write(connfd, "HTTP/1.0 200 OK\r\n", 17);
 				execl(content_name, content_name, NULL);
-				exit(EXIT_SUCCESS);
 			}
-
-			/* close connection */
-			close(connfd);
 
 		/* serving static content */
 		} else {
@@ -197,24 +196,56 @@ void server_response(int connfd, request* req)
 					 "Content-type: %s\r\n\r\n",
 					 content_length(content_name), content_type(content_name));
 
-			/* send headers */
+			/* send response line and headers */
 			write(connfd, res_buf, strlen(res_buf));
 
-			/* send body */
+			/* send response body */
 			if (send_body) {
 				content_file = fopen(content_name, "r");
 				while ((res_size = fread(res_buf, 1, sizeof(res_buf), content_file)) != 0)
 					write(connfd, res_buf, res_size);
 				fclose(content_file);
 			}
-
-			/* close connection */
-			close(connfd);
 		}
+
+		/* close connection */
+		close(connfd);
 
 	/* receive data from client */
 	} else if (!strcmp(req->method, "POST")) {
-		error_page(connfd, C501);
+		long length;
+		char *temp;
+
+		/* check if content-length header is present */
+		temp = strstr(req->headers, "Content-Length: ");
+		if (!temp || (length = atol(temp+16)) < 1)
+			{ error_page(connfd, C400); return; }
+
+		/* check if content is dynamic and can be executed*/
+		if (strncmp(content_name, "./cgi-bin/", 10) || access(content_name, X_OK) == -1)
+			{ error_page(connfd, C403); return; }
+
+		int fdpipe[2];
+		pipe(fdpipe);
+
+		/* execute script */
+		if (!fork()) {
+			dup2(fdpipe[0], 0);
+			close(fdpipe[0]);
+			sprintf(res_buf, "REQUEST_METHOD=POST");
+			putenv(res_buf);
+			sprintf(res_buf+20, "CONTENT_LENGTH=%ld", length);
+			putenv(res_buf+20);
+			dup2(connfd, 1);
+			write(connfd, "HTTP/1.0 200 OK\r\n", 17);
+			execl(content_name, content_name, NULL);
+		}
+
+		write(fdpipe[1], req->body, strlen(req->body));
+
+		/* close connection */
+		close(connfd);
+		close(fdpipe[1]);
 
 	/* method not implemented */
 	} else {
